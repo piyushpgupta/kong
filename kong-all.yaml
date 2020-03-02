@@ -1,0 +1,399 @@
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: kong
+spec:
+  ports:
+  - name: pgql
+    port: 5432
+    targetPort: 5432
+    protocol: TCP
+  selector:
+    app: postgres
+
+---
+apiVersion: apps/v1  
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: kong
+spec:
+  serviceName: "postgres"
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:9.5
+        resources:
+          limits:
+           cpu: 200m
+           memory: 300Mi
+          requests:
+           cpu: 200m
+           memory: 300Mi
+        volumeMounts:
+        - name: datadir
+          mountPath: /var/lib/postgresql/data
+          subPath: pgdata
+        env:
+        - name: POSTGRES_USER
+          value: kong
+        - name: POSTGRES_PASSWORD
+          value: kong
+        - name: POSTGRES_DB
+          value: kong
+        - name: PGDATA
+          value: /var/lib/postgresql/data/pgdata
+        ports:
+        - containerPort: 5432
+      # No pre-stop hook is required, a SIGTERM plus some time is all that's
+      # needed for graceful shutdown of a node.
+      terminationGracePeriodSeconds: 60
+  volumeClaimTemplates:
+  - metadata:
+      name: datadir
+    spec:
+      accessModes:
+      - "ReadWriteOnce"
+      resources:
+        requests:
+          storage: 5Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kong-ingress-controller
+  namespace: kong
+spec:
+  type: LoadBalancer #NodePort - default
+  ports:
+  - name: kong-admin
+    port: 80
+    targetPort: 8001
+    protocol: TCP
+  selector:
+    app: ingress-kong
+
+---
+
+apiVersion: extensions/v1beta1
+kind: Deployment
+metadata:
+  labels:
+    app: ingress-kong
+  name: kong-ingress-controller
+  namespace: kong
+spec:
+  selector:
+    matchLabels:
+      app: ingress-kong
+  strategy:
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+    type: RollingUpdate
+  template:
+    metadata:
+      annotations:
+        # the returned metrics are related to the kong ingress controller not kong itself
+        prometheus.io/port: "10254"
+        prometheus.io/scrape: "true"
+      labels:
+        app: ingress-kong
+    spec:
+      serviceAccountName: default
+      initContainers:
+      - name: wait-for-migrations
+        image: kong:1.1
+        resources:
+          limits:
+           cpu: 400m
+           memory: 500Mi
+          requests:
+           cpu: 400m
+           memory: 500Mi
+        command: [ "/bin/sh", "-c", "kong migrations list" ]
+        env:
+        - name: KONG_ADMIN_LISTEN
+          value: 'off'
+        - name: KONG_PROXY_LISTEN
+          value: 'off'
+        - name: KONG_PROXY_ACCESS_LOG
+          value: "/dev/stdout"
+        - name: KONG_ADMIN_ACCESS_LOG
+          value: "/dev/stdout"
+        - name: KONG_PROXY_ERROR_LOG
+          value: "/dev/stderr"
+        - name: KONG_ADMIN_ERROR_LOG
+          value: "/dev/stderr"
+        - name: KONG_PG_HOST
+          value: postgres
+        - name: KONG_PG_PASSWORD
+          value: kong
+      containers:
+      - name: admin-api
+        image: kong:1.1
+        env:
+        - name: KONG_PG_PASSWORD
+          value: kong
+        - name: KONG_PG_HOST
+          value: postgres
+        - name: KONG_ADMIN_ACCESS_LOG
+          value: /dev/stdout
+        - name: KONG_ADMIN_ERROR_LOG
+          value: /dev/stderr
+        - name: KONG_ADMIN_LISTEN
+          value: 0.0.0.0:8001, 0.0.0.0:8444 ssl
+        - name: KONG_PROXY_LISTEN
+          value: 'off'
+        ports:
+        - name: kong-admin
+          containerPort: 8001
+        livenessProbe:
+          failureThreshold: 3
+          httpGet:
+            path: /status
+            port: 8001
+            scheme: HTTP
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          successThreshold: 1
+          timeoutSeconds: 1
+        readinessProbe:
+          failureThreshold: 3
+          httpGet:
+            path: /status
+            port: 8001
+            scheme: HTTP
+          periodSeconds: 10
+          successThreshold: 1
+          timeoutSeconds: 1
+        resources:
+          limits:
+           cpu: 400m
+           memory: 500Mi
+          requests:
+           cpu: 400m
+           memory: 500Mi 
+      - name: ingress-controller
+        args:
+        - /kong-ingress-controller
+        # the kong URL points to the kong admin api server
+        - --kong-url=https://localhost:8444
+        - --admin-tls-skip-verify
+        # Service from were we extract the IP address/es to use in Ingress status
+        - --publish-service=kong/kong-proxy
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: metadata.namespace
+        image: kong-docker-kubernetes-ingress-controller.bintray.io/kong-ingress-controller:0.4.0
+        imagePullPolicy: IfNotPresent
+        livenessProbe:
+          failureThreshold: 3
+          httpGet:
+            path: /healthz
+            port: 10254
+            scheme: HTTP
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          successThreshold: 1
+          timeoutSeconds: 1
+        readinessProbe:
+          failureThreshold: 3
+          httpGet:
+            path: /healthz
+            port: 10254
+            scheme: HTTP
+          periodSeconds: 10
+          successThreshold: 1
+          timeoutSeconds: 1
+        resources:
+          limits:
+           cpu: 400m
+           memory: 500Mi
+          requests:
+           cpu: 400m
+           memory: 500Mi
+---
+
+apiVersion: autoscaling/v1
+kind: HorizontalPodAutoscaler
+metadata:
+  name: kong-ingress-controller-hpa
+  namespace: kong
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1beta1
+    kind: Deployment
+    name: kong-ingress-controller
+  minReplicas: 1
+  maxReplicas: 3
+  targetCPUUtilizationPercentage: 60
+
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: kong-proxy
+  namespace: kong
+spec:
+  type: LoadBalancer
+  ports:
+  - name: kong-proxy
+    port: 80
+    targetPort: 8000
+    protocol: TCP
+  - name: kong-proxy-ssl
+    port: 443
+    targetPort: 8443
+    protocol: TCP
+  selector:
+    app: kong
+---
+apiVersion: extensions/v1beta1
+kind: Deployment
+metadata:
+  name: kong
+  namespace: kong
+spec:
+  template:
+    metadata:
+      labels:
+        name: kong
+        app: kong
+    spec:
+      initContainers:
+      # hack to verify that the DB is up to date or not
+      # TODO remove this for Kong >= 0.15.0
+      - name: wait-for-migrations
+        image: kong:1.1
+        resources:
+          limits:
+           cpu: 300m
+           memory: 500Mi
+          requests:
+           cpu: 300m
+           memory: 500Mi 
+        command: [ "/bin/sh", "-c", "kong migrations list" ]
+        env:
+        - name: KONG_ADMIN_LISTEN
+          value: 'off'
+        - name: KONG_PROXY_LISTEN
+          value: 'off'
+        - name: KONG_PROXY_ACCESS_LOG
+          value: "/dev/stdout"
+        - name: KONG_ADMIN_ACCESS_LOG
+          value: "/dev/stdout"
+        - name: KONG_PROXY_ERROR_LOG
+          value: "/dev/stderr"
+        - name: KONG_ADMIN_ERROR_LOG
+          value: "/dev/stderr"
+        - name: KONG_PG_HOST
+          value: postgres
+        - name: KONG_PG_PASSWORD
+          value: kong
+      containers:
+      - name: kong-proxy
+        image: kong:1.1
+        resources:
+          limits:
+           cpu: 300m
+           memory: 500Mi
+          requests:
+           cpu: 300m
+           memory: 500Mi 
+        env:
+        - name: KONG_PG_PASSWORD
+          value: kong
+        - name: KONG_PG_HOST
+          value: postgres
+        - name: KONG_PROXY_ACCESS_LOG
+          value: "/dev/stdout"
+        - name: KONG_PROXY_ERROR_LOG
+          value: "/dev/stderr"
+        - name: KONG_ADMIN_LISTEN
+          value: 'off'
+        ports:
+        - name: proxy
+          containerPort: 8000
+          protocol: TCP
+        - name: proxy-ssl
+          containerPort: 8443
+          protocol: TCP
+        lifecycle:
+          preStop:
+            exec:
+              command: [ "/bin/sh", "-c", "kong quit" ]
+
+---
+
+apiVersion: autoscaling/v1
+kind: HorizontalPodAutoscaler
+metadata:
+  name: kong-proxy-hpa
+  namespace: kong
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1beta1
+    kind: Deployment
+    name: kong
+  minReplicas: 1
+  maxReplicas: 3
+  targetCPUUtilizationPercentage: 60
+         
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kong-migrations
+  namespace: kong
+spec:
+  template:
+    metadata:
+      name: kong-migrations
+    spec:
+      initContainers:
+      - name: wait-for-postgres
+        image: busybox
+        resources:
+          limits:
+           cpu: 300m
+           memory: 500Mi
+          requests:
+           cpu: 300m
+           memory: 500Mi
+        env:
+        - name: KONG_PG_HOST
+          value: postgres
+        - name: KONG_PG_PORT
+          value: "5432"
+        command: [ "/bin/sh", "-c", "until nc -zv $KONG_PG_HOST $KONG_PG_PORT -w1; do echo 'waiting for db'; sleep 1; done" ]
+      containers:
+      - name: kong-migrations
+        image: kong:1.1-centos
+        env:
+        - name: KONG_PG_PASSWORD
+          value: kong
+        - name: KONG_PG_HOST
+          value: postgres
+        - name: KONG_PG_PORT
+          value: "5432"
+        command: [ "/bin/sh", "-c", "kong migrations bootstrap" ]
+      restartPolicy: OnFailure
